@@ -1,0 +1,10 @@
+fastapi>=0.115,<1
+uvicorn>=0.34,<1
+SQLAlchemy>=2.0.40,<2.1
+psycopg[binary]>=3.2,<4
+alembic>=1.14,<2
+httpx>=0.28,<0.29
+itsdangerous>=2.2,<3
+pypdf>=6,<8
+Pillow>=11,<13
+pytest>=8,<10

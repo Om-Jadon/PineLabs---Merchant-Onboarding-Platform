@@ -1,0 +1,63 @@
+name: merchant-onboarding
+
+x-backend: &backend
+  image: merchant-onboarding-local:dev
+  init: true
+  environment: &backend-env
+    DATABASE_URL: postgresql+psycopg://merchant:demo-local@db:5432/merchant
+    SIMULATOR_URL: http://simulator:8001
+    CALLBACK_URL: http://api:8000
+    KEY_DIRECTORY: /var/lib/merchant-keys
+  volumes:
+    - keys:/var/lib/merchant-keys
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: merchant
+      POSTGRES_USER: merchant
+      POSTGRES_PASSWORD: demo-local
+    volumes:
+      - database:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U merchant -d merchant"]
+      interval: 2s
+      timeout: 4s
+      retries: 30
+  api:
+    <<: *backend
+    build: .
+    command: ["sh", "-c", "alembic upgrade head && exec uvicorn desk.api:app --host 0.0.0.0 --port 8000 --no-access-log"]
+    ports: ["127.0.0.1:${MERCHANT_PORT:-8018}:8000"]
+    depends_on:
+      db: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health', timeout=2)"]
+      interval: 3s
+      timeout: 4s
+      retries: 30
+  simulator:
+    <<: *backend
+    pull_policy: never
+    command: ["uvicorn", "desk.simulator:app", "--host", "0.0.0.0", "--port", "8001", "--no-access-log"]
+    depends_on:
+      api: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health', timeout=2)"]
+      interval: 3s
+      timeout: 4s
+      retries: 30
+  worker:
+    <<: *backend
+    environment:
+      <<: *backend-env
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    pull_policy: never
+    command: ["python", "-m", "desk.worker"]
+    depends_on:
+      api: {condition: service_healthy}
+      simulator: {condition: service_healthy}
+volumes:
+  database:
+  keys:
