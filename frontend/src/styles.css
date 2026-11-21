@@ -673,7 +673,7 @@
 }
 .queue-tools select,
 .search-box,
-.form-stack input:not([type="file"]),
+.form-stack input:not([type="file"]):not([type="checkbox"]),
 .form-stack select,
 .form-stack textarea,
 .scenario select {
@@ -744,6 +744,20 @@
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 14px;
+}
+.replacement-list {
+  display: grid;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid var(--color-border);
+  border-radius: 7px;
+}
+.form-stack .replacement-list label {
+  display: flex;
+  align-items: center;
+}
+.replacement-list input[type="checkbox"] {
+  width: auto;
 }
 .upload-heading {
   border-top: 1px solid var(--color-border);

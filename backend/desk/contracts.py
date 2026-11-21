@@ -1,6 +1,19 @@
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
+
+
+def database_text(value: str) -> str:
+    if "\x00" in value:
+        raise ValueError("Use text without null characters.")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError("Use valid Unicode text.") from None
+    return value
+
+
+Text = Annotated[str, AfterValidator(database_text)]
 
 Kind = Literal["PAN", "GST"]
 Scenario = Literal["standard", "late_callback", "lost_mid_response"]
@@ -12,8 +25,8 @@ class Contract(BaseModel):
 
 class Upload(Contract):
     kind: Literal["PAN", "GST", "AUTO"] = "AUTO"
-    filename: str = Field(min_length=1, max_length=120)
-    fields: dict[str, str] | None = None
+    filename: Text = Field(min_length=1, max_length=120)
+    fields: dict[Text, Text] | None = None
     content_base64: str | None = Field(None, max_length=4_194_304)
 
     @model_validator(mode="after")
@@ -41,45 +54,56 @@ class DocumentsInput(Contract):
 
 
 class Submission(DocumentsInput):
-    submission_key: str = Field(min_length=1, max_length=100)
-    legal_name: str = Field(default="", max_length=140)
-    pan: str = Field(default="", max_length=24)
-    gstin: str = Field(default="", max_length=28)
+    submission_key: Text = Field(min_length=1, max_length=100)
+    legal_name: Text = Field(default="", max_length=140)
+    pan: Text = Field(default="", max_length=24)
+    gstin: Text = Field(default="", max_length=28)
     scenario: Scenario = "standard"
 
 
 class Correction(DocumentsInput):
     expected_version: int = Field(ge=1)
-    legal_name: str | None = Field(None, max_length=140)
-    pan: str | None = Field(None, max_length=24)
-    gstin: str | None = Field(None, max_length=28)
+    legal_name: Text | None = Field(None, max_length=140)
+    pan: Text | None = Field(None, max_length=24)
+    gstin: Text | None = Field(None, max_length=28)
+    replace_document_ids: list[Annotated[Text, Field(min_length=1, max_length=36)]] | None = Field(
+        None, max_length=2
+    )
 
 
 class Action(Contract):
     action: Literal["request_info", "retry", "reject"]
     expected_version: int = Field(ge=1)
-    reason: str = Field(min_length=1, max_length=500)
+    reason: Text = Field(min_length=1, max_length=500)
     kind: Kind | None = None
 
 
 class Callback(Contract):
-    event_id: str = Field(min_length=1, max_length=100)
-    attempt_id: str = Field(min_length=1, max_length=64)
-    provider_ref: str = Field(min_length=1, max_length=100)
+    event_id: Text = Field(min_length=1, max_length=100)
+    attempt_id: Text = Field(min_length=1, max_length=64)
+    provider_ref: Text = Field(min_length=1, max_length=100)
     outcome: Literal["PASSED", "FAILED"]
     reason: Literal["PAN_MATCH", "GST_ACTIVE", "GST_INACTIVE", "RECORD_MISMATCH"]
 
 
 class VerifyInput(Contract):
-    attempt_id: str
-    case_id: str
-    legal_name: str
-    pan: str
-    gstin: str = ""
+    attempt_id: Text = Field(min_length=1, max_length=64)
+    case_id: Text = Field(min_length=1, max_length=64)
+    legal_name: Text = Field(max_length=140)
+    pan: Text = Field(max_length=24)
+    gstin: Text = Field(default="", max_length=28)
     scenario: Scenario
-    number: int
+    number: int = Field(ge=1)
 
 
 class IssueInput(Contract):
-    case_id: str
+    case_id: Text = Field(min_length=1, max_length=64)
     scenario: Scenario
+
+
+class VerificationReply(Contract):
+    provider_ref: Text = Field(min_length=1, max_length=100)
+
+
+class IssueReply(Contract):
+    mid: str = Field(pattern=r"^MID-[A-F0-9]{16}$")

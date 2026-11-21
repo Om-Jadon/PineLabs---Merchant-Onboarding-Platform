@@ -12,6 +12,7 @@ import { Button } from "./ui/button"
 import { ErrorNotice, Loading } from "./common"
 import {
   api,
+  ApiError,
   go,
   message,
   useResource,
@@ -67,29 +68,34 @@ async function sampleFile(name: string) {
   return readUpload(new File([await response.blob()], name))
 }
 
-function Form({ initial }: { initial?: CaseDetail }) {
+function Form({ initial, reload }: { initial?: CaseDetail; reload?: () => void }) {
   const [fields, setFields] = useState<Declared>(initial?.declared || empty)
   const [version] = useState(initial?.version)
   const [files, setFiles] = useState<Upload[]>([])
+  const [replaced, setReplaced] = useState<string[]>([])
+  const [stale, setStale] = useState(false)
   const [key] = useState(() => crypto.randomUUID())
   const [scenario, setScenario] = useState("standard")
   const [busy, setBusy] = useState(false),
     [error, setError] = useState("")
   const { data: samples } = useResource<Samples>("/api/demo/fixtures")
   const correcting = Boolean(initial)
+  const needsPan = initial?.requested_kind === "PAN"
+  const unclassified = initial?.documents.filter((d) => d.current && d.kind === "AUTO") || []
   async function loadSample(active: boolean) {
     if (!samples) return
     setBusy(true)
     setError("")
     try {
       const names = correcting
-        ? ["gst-current.pdf"]
+        ? [needsPan ? "pan.json" : "gst-current.pdf"]
         : ["pan.json", active ? "gst-current.pdf" : "gst-inactive.pdf"]
       const uploads = await Promise.all(names.map(sampleFile))
       setFiles(uploads)
+      setReplaced([])
       setFields((current) =>
         correcting
-          ? { ...current, gstin: samples.current_gstin }
+          ? { ...current, ...(needsPan ? { pan: samples.pan } : { gstin: samples.current_gstin }) }
           : {
               legal_name: samples.legal_name,
               pan: samples.pan,
@@ -127,7 +133,7 @@ function Form({ initial }: { initial?: CaseDetail }) {
         ...fields,
         documents: files,
         ...(initial
-          ? { expected_version: version }
+          ? { expected_version: version, replace_document_ids: replaced }
           : { submission_key: key, scenario }),
       }
       const target = initial
@@ -137,6 +143,7 @@ function Form({ initial }: { initial?: CaseDetail }) {
       go("/case/" + result.id)
     } catch (e) {
       setError(message(e))
+      setStale(Boolean(initial) && e instanceof ApiError && e.status === 409)
       setBusy(false)
     }
   }
@@ -236,7 +243,11 @@ function Form({ initial }: { initial?: CaseDetail }) {
                   <button
                     type="button"
                     aria-label={"Remove " + f.filename}
-                    onClick={() => setFiles(files.filter((_, j) => i !== j))}
+                    disabled={busy}
+                    onClick={() => {
+                      setFiles(files.filter((_, j) => i !== j))
+                      setReplaced([])
+                    }}
                   >
                     <X />
                   </button>
@@ -244,14 +255,41 @@ function Form({ initial }: { initial?: CaseDetail }) {
               ))}
             </ul>
           )}
+          {files.length > 0 && unclassified.length > 0 && (
+            <fieldset className="replacement-list">
+              <legend>Which unidentified files do these uploads replace?</legend>
+              {unclassified.map((doc) => (
+                <label key={doc.id}>
+                  <input
+                    type="checkbox"
+                    checked={replaced.includes(doc.id)}
+                    disabled={busy || (!replaced.includes(doc.id) && replaced.length >= files.length)}
+                    onChange={(e) => setReplaced(e.target.checked
+                      ? [...replaced, doc.id]
+                      : replaced.filter((id) => id !== doc.id))}
+                  />
+                  {doc.filename} · v{doc.revision}
+                </label>
+              ))}
+            </fieldset>
+          )}
           <p className="helper">
             Use synthetic documents. When Gemini is configured, the worker sends
             the attached PDF or image to Google for extraction.
           </p>
           {error && <ErrorNotice text={error} />}
+          {stale && (
+            <Button type="button" variant="outline" onClick={() => {
+              setReplaced([])
+              setStale(false)
+              reload?.()
+            }}>
+              Reload current application
+            </Button>
+          )}
           <div className="form-actions">
             <a href={initial ? "#/case/" + initial.id : "#/queue"}>Cancel</a>
-            <Button type="submit" disabled={busy}>
+            <Button type="submit" disabled={busy || stale}>
               {busy
                 ? "Working…"
                 : correcting
@@ -267,7 +305,9 @@ function Form({ initial }: { initial?: CaseDetail }) {
           </div>
           <p>
             {correcting
-              ? "The current certificate carries the active GSTIN for Riverbend Stationery."
+              ? needsPan
+                ? "The PAN record contains the holder name and PAN for Riverbend Stationery."
+                : "The current certificate carries the active GSTIN for Riverbend Stationery."
               : "Try Riverbend Stationery with an inactive or current GST registration."}
           </p>
           {correcting ? (
@@ -277,7 +317,7 @@ function Form({ initial }: { initial?: CaseDetail }) {
               disabled={busy || !samples}
               onClick={() => loadSample(true)}
             >
-              Load current certificate
+              {needsPan ? "Load PAN record" : "Load current certificate"}
             </Button>
           ) : (
             <>
@@ -338,7 +378,7 @@ function Existing({ id }: { id: string }) {
     "/api/applications/" + id,
   )
   return data ? (
-    <Form key={data.id} initial={data} />
+    <Form key={data.id + "/" + data.version} initial={data} reload={reload} />
   ) : error ? (
     <ErrorNotice text={error} retry={reload} />
   ) : (

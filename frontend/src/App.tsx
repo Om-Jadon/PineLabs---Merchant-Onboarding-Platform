@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import {
   Building2,
   ChevronRight,
@@ -42,21 +42,60 @@ export default function App() {
   const [persona, setPersona] = useState<Persona>()
   const [error, setError] = useState("")
   const [busy, setBusy] = useState(false)
+  const sessionGeneration = useRef(0)
+  const switching = useRef(false)
   useEffect(() => {
-    api<Persona>("/api/session")
-      .then(setPersona)
-      .catch((e) => setError(message(e)))
+    async function readSession() {
+      const generation = ++sessionGeneration.current
+      try {
+        const current = await api<Persona>("/api/session")
+        if (generation === sessionGeneration.current) {
+          setPersona(current)
+          setError("")
+        }
+      } catch (e) {
+        if (generation === sessionGeneration.current) setError(message(e))
+      }
+    }
+    function onSessionChange(event: StorageEvent) {
+      if (event.key !== "merchant-desk-session") return
+      setPersona(undefined)
+      go("/queue")
+      void readSession()
+    }
+    function onFocus() {
+      if (!switching.current) void readSession()
+    }
+    void readSession()
+    addEventListener("storage", onSessionChange)
+    addEventListener("focus", onFocus)
+    return () => {
+      sessionGeneration.current++
+      removeEventListener("storage", onSessionChange)
+      removeEventListener("focus", onFocus)
+    }
   }, [])
   async function openAs(role: "merchant" | "operator", path: string) {
     setBusy(true)
+    switching.current = true
     setError("")
     try {
-      if (persona?.role !== role)
-        setPersona(await api<Persona>("/api/demo/session", { persona: role }))
+      if (persona?.role !== role) {
+        const generation = ++sessionGeneration.current
+        const current = await api<Persona>("/api/demo/session", { persona: role })
+        try {
+          localStorage.setItem("merchant-desk-session", crypto.randomUUID())
+        } catch {
+          // Browsers with storage disabled still refresh their session when a tab regains focus.
+        }
+        if (generation !== sessionGeneration.current) return
+        setPersona(current)
+      }
       go(path)
     } catch (e) {
       setError(message(e))
     } finally {
+      switching.current = false
       setBusy(false)
     }
   }
@@ -74,7 +113,7 @@ export default function App() {
           </a>
           <nav aria-label="Workspace" className="workspace-nav">
             <button
-              disabled={busy}
+              disabled={busy || !persona}
               className={operator ? "selected" : ""}
               onClick={() => openAs("operator", "/queue")}
             >
@@ -82,7 +121,7 @@ export default function App() {
               Review queue
             </button>
             <button
-              disabled={busy}
+              disabled={busy || !persona}
               className={persona && !operator ? "selected" : ""}
               onClick={() => openAs("merchant", "/queue")}
             >
@@ -109,7 +148,7 @@ export default function App() {
         {!persona ? (
           <Loading label="Opening workspace" />
         ) : (
-          <div key={persona.role}>
+          <div key={persona.role + "/" + persona.owner}>
             {!page ? (
               <FirstCase persona={persona} />
             ) : page === "case" && id ? (

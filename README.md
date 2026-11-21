@@ -1,5 +1,7 @@
 # Merchant desk
 
+Merchant desk implements the Pine Labs **Autonomous Merchant Onboarding Platform** case study.
+
 A merchant submits a PAN record and a GST certificate. The desk reads the evidence, compares it with the form and sends two independent verification requests. An inactive GST registration gives the operator a specific reason to request a replacement. A successful correction can activate the merchant automatically.
 
 ## Run the demo
@@ -79,8 +81,12 @@ npx playwright install chromium --only-shell
 npm run test:e2e
 ```
 
-The end-to-end suite submits a new demo application through the UI, runs the correction and replay journey, and checks the mobile document viewer. Two additional tests use the simulator's HTTP deliveries to verify recovery from a late GST callback and a lost MID response. The browser's binary uploads use the reader configured on the running worker. The main correction journey also passed on a fresh database with the local reader alone.
+The end-to-end suite covers the full correction and replay journey, mobile document viewing, late callbacks, lost issuance responses, cross-tab identity changes, stale corrections and PAN replacement requests. Binary uploads use the reader configured on the running worker.
+
+## Hardening
+
+Compose publishes the desk on loopback. A one-shot migration process provisions separate database logins for the workflow and provider simulator. The worker receives the simulator request credential and, when configured, the Gemini key. Only the API holds the browser session signing key. The existing database and session-key volumes carry forward during a normal rebuild.
 
 ## Scope
 
-The app models one cohort of GST-registered merchants. PAN and GST are simulated registries with one fictional business and two registration records. The local demo uses switchable signed-cookie identities, server-side role and ownership checks, and private evidence storage. Bank and risk providers, duplicate-entity matching, production identity management and compliance retention policies are outside this build. [Case study](PS.md) · [Development plan](DEVELOPMENT_PLAN.md)
+The app models one cohort of GST-registered merchants. PAN and GST are simulated registries with one fictional business and two registration records. The local demo uses switchable signed-cookie identities, server-side role and ownership checks, and private evidence storage. Bank and risk providers, duplicate-entity matching, production identity management and compliance retention policies are outside this build.

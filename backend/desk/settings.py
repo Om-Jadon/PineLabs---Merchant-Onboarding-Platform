@@ -26,19 +26,33 @@ def now():
     return datetime.now(UTC)
 
 
+def key_material(path: Path, *, read_only=False) -> bytes:
+    if read_only:
+        with path.open("rb") as file:
+            fcntl.flock(file, fcntl.LOCK_SH)
+            key = file.read(33)
+    else:
+        path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        with open(os.open(path, os.O_RDWR | os.O_CREAT, 0o600), "r+b") as file:
+            fcntl.flock(file, fcntl.LOCK_EX)
+            key = file.read(33)
+            if not key:
+                key = os.urandom(32)
+                file.write(key)
+                file.flush()
+                os.fsync(file.fileno())
+    if len(key) != 32:
+        raise RuntimeError("The stored key is incomplete. Restore the key volume.")
+    return key
+
+
 @lru_cache
 def secret(purpose: str) -> bytes:
-    directory = Path(os.getenv("KEY_DIRECTORY", ".local/keys"))
-    directory.mkdir(parents=True, mode=0o700, exist_ok=True)
-    path = directory / "demo.key"
-    with open(os.open(path, os.O_RDWR | os.O_CREAT, 0o600), "r+b") as file:
-        fcntl.flock(file, fcntl.LOCK_EX)
-        key = file.read()
-        if not key:
-            key = os.urandom(32)
-            file.write(key)
-            file.flush()
-            os.fsync(file.fileno())
+    directory_name = {"session": "SESSION_KEY_DIRECTORY", "simulator": "SIMULATOR_KEY_DIRECTORY"}.get(
+        purpose, "KEY_DIRECTORY"
+    )
+    directory = Path(os.getenv(directory_name) or os.getenv("KEY_DIRECTORY", ".local/keys"))
+    key = key_material(directory / "demo.key", read_only=os.getenv("KEYS_READ_ONLY") == "1")
     return hmac.digest(key, purpose.encode(), "sha256")
 
 

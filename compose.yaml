@@ -1,37 +1,67 @@
 name: merchant-onboarding
 
 x-backend: &backend
-  image: merchant-onboarding-local:dev
+  image: ${COMPOSE_PROJECT_NAME:-merchant-onboarding}-local:dev
   init: true
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  tmpfs: ["/tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777"]
+  pids_limit: 128
+  mem_limit: 1g
   environment: &backend-env
-    DATABASE_URL: postgresql+psycopg://merchant:demo-local@db:5432/merchant
+    DATABASE_URL: postgresql+psycopg://desk_workflow@db:5432/merchant
+    DATABASE_LOGIN_FILE: /var/lib/workflow-login/login.key
     SIMULATOR_URL: http://simulator:8001
     CALLBACK_URL: http://api:8000
-    KEY_DIRECTORY: /var/lib/merchant-keys
-  volumes:
-    - keys:/var/lib/merchant-keys
+    KEY_DIRECTORY: /var/lib/merchant-webhooks
+    SESSION_KEY_DIRECTORY: /var/lib/merchant-keys
+    SIMULATOR_KEY_DIRECTORY: /var/lib/merchant-requests
 
 services:
   db:
-    image: postgres:17-alpine
+    image: ${COMPOSE_PROJECT_NAME:-merchant-onboarding}-postgres:17
+    build:
+      context: .
+      target: database
     environment:
       POSTGRES_DB: merchant
       POSTGRES_USER: merchant
-      POSTGRES_PASSWORD: demo-local
+      # The image needs a bootstrap password. Administration uses the private Unix socket.
+      POSTGRES_PASSWORD_FILE: /proc/sys/kernel/random/uuid
+    command: ["postgres", "-c", "hba_file=/etc/postgresql/merchant_hba.conf"]
     volumes:
       - database:/var/lib/postgresql/data
+      - db_socket:/var/run/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U merchant -d merchant"]
       interval: 2s
       timeout: 4s
       retries: 30
-  api:
+  migrate:
     <<: *backend
     build: .
-    command: ["sh", "-c", "alembic upgrade head && exec uvicorn desk.api:app --host 0.0.0.0 --port 8000 --no-access-log"]
-    ports: ["127.0.0.1:${MERCHANT_PORT:-8018}:8000"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://merchant@/merchant?host=/var/run/postgresql
+    volumes:
+      - db_socket:/var/run/postgresql:ro
+      - workflow_login:/var/lib/workflow-login
+      - provider_login:/var/lib/provider-login
+    command: ["sh", "-c", "alembic upgrade head && exec python -m desk.provision_db"]
     depends_on:
       db: {condition: service_healthy}
+  api:
+    <<: *backend
+    pull_policy: never
+    volumes:
+      - keys:/var/lib/merchant-keys
+      - request_keys:/var/lib/merchant-requests
+      - webhook_keys:/var/lib/merchant-webhooks
+      - workflow_login:/var/lib/workflow-login:ro
+    command: ["uvicorn", "desk.api:app", "--host", "0.0.0.0", "--port", "8000", "--limit-concurrency", "24", "--no-access-log"]
+    ports: ["127.0.0.1:${MERCHANT_PORT:-8018}:8000"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health', timeout=2)"]
       interval: 3s
@@ -39,6 +69,15 @@ services:
       retries: 30
   simulator:
     <<: *backend
+    environment:
+      <<: *backend-env
+      KEYS_READ_ONLY: "1"
+      DATABASE_URL: postgresql+psycopg://desk_provider@db:5432/merchant
+      DATABASE_LOGIN_FILE: /var/lib/provider-login/login.key
+    volumes:
+      - request_keys:/var/lib/merchant-requests:ro
+      - webhook_keys:/var/lib/merchant-webhooks:ro
+      - provider_login:/var/lib/provider-login:ro
     pull_policy: never
     command: ["uvicorn", "desk.simulator:app", "--host", "0.0.0.0", "--port", "8001", "--no-access-log"]
     depends_on:
@@ -53,6 +92,10 @@ services:
     environment:
       <<: *backend-env
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      KEYS_READ_ONLY: "1"
+    volumes:
+      - request_keys:/var/lib/merchant-requests:ro
+      - workflow_login:/var/lib/workflow-login:ro
     pull_policy: never
     command: ["python", "-m", "desk.worker"]
     depends_on:
@@ -61,3 +104,8 @@ services:
 volumes:
   database:
   keys:
+  request_keys:
+  webhook_keys:
+  db_socket:
+  workflow_login:
+  provider_login:

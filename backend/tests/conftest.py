@@ -11,6 +11,8 @@ def isolated_settings(monkeypatch, tmp_path):
     from desk.settings import secret
 
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    for key in ("SESSION_KEY_DIRECTORY", "SIMULATOR_KEY_DIRECTORY", "KEYS_READ_ONLY"):
+        monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("KEY_DIRECTORY", str(tmp_path / "keys"))
     secret.cache_clear()
     yield

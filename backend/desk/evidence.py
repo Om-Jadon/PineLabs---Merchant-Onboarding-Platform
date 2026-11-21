@@ -3,13 +3,13 @@ import binascii
 import json
 import re
 import subprocess
+from tempfile import TemporaryFile
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import PurePath
+from threading import BoundedSemaphore
 
 from PIL import Image, UnidentifiedImageError
-from pypdf import PdfReader
-from pypdf.errors import PyPdfError
 
 from .contracts import Upload
 from .db import Case, Document
@@ -20,6 +20,7 @@ PATTERNS = {
     "pan": re.compile(r"[A-Z]{5}[0-9]{4}[A-Z]"),
     "gstin": re.compile(r"[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][A-Z0-9]Z[A-Z0-9]"),
 }
+parser_slots = BoundedSemaphore(2)
 
 
 class Problem(Exception):
@@ -62,11 +63,67 @@ class Reading:
     note: str = ""
 
 
+def document_tool(command, data, *, seconds, output_limit):
+    # Callers supply the executable and flags. The document goes to stdin; prlimit execs the parser.
+    limits = ["prlimit", "--as=536870912", f"--cpu={seconds}", f"--fsize={output_limit + 1}", "--"]
+    if not parser_slots.acquire(timeout=1):
+        raise OSError("Document readers are busy")
+    try:
+        with TemporaryFile() as output:
+            subprocess.run(
+                [*limits, *command],
+                input=data,
+                stdout=output,
+                stderr=subprocess.DEVNULL,
+                timeout=seconds,
+                check=True,
+                env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "OMP_THREAD_LIMIT": "1"},
+            )
+            output.seek(0)
+            result = output.read(output_limit + 1)
+    finally:
+        parser_slots.release()
+    if len(result) > output_limit:
+        raise ValueError("Document output exceeded its limit")
+    return result
+
+
 def pdf_text(data):
-    reader = PdfReader(BytesIO(data))
-    if reader.is_encrypted or len(reader.pages) > 8:
-        raise Problem(422, "Use an unlocked PDF with at most eight pages.")
-    return [(page.extract_text() or "")[:100_000] for page in reader.pages]
+    result = document_tool(
+        ["pdftotext", "-layout", "-enc", "UTF-8", "-f", "1", "-l", "8", "-", "-"],
+        data,
+        seconds=8,
+        output_limit=3_200_000,
+    )
+    pages = result.decode("utf-8", errors="replace").split("\f")
+    if pages[-1] == "":
+        pages.pop()
+    return pages
+
+
+def preview_pdf(data, page):
+    try:
+        return document_tool(
+            [
+                "pdftoppm",
+                "-f",
+                str(page),
+                "-l",
+                str(page),
+                "-singlefile",
+                "-scale-to",
+                "1000",
+                "-png",
+                "-",
+            ],
+            data,
+            seconds=8,
+            output_limit=4_194_304,
+        )
+    except OSError:
+        raise Problem(503, "The preview service is unavailable. Try again.") from None
+    except (subprocess.SubprocessError, ValueError):
+        raise Problem(422, "Preview unavailable. Download the original document.") from None
 
 
 def local_read(data, mime):
@@ -74,23 +131,19 @@ def local_read(data, mime):
         method = "PDF text"
         try:
             pages = pdf_text(data)
-        except (PyPdfError, ValueError, KeyError, TypeError, IndexError):
-            pages = []
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return Reading("OTHER", {}, method, "TECHNICAL", "Local PDF reader unavailable")
     else:
         method = "Local OCR"
         try:
-            with Image.open(BytesIO(data)) as img:
-                stream = BytesIO()
-                img.convert("RGB").save(stream, "PNG")
-            run = subprocess.run(
+            result = document_tool(
                 ["tesseract", "stdin", "stdout", "-l", "eng", "--psm", "6"],
-                input=stream.getvalue(),
-                capture_output=True,
-                timeout=12,
-                check=True,
+                data,
+                seconds=12,
+                output_limit=400_000,
             )
-            pages = [run.stdout.decode("utf-8", errors="replace")]
-        except (OSError, subprocess.SubprocessError):
+            pages = [result.decode("utf-8", errors="replace")]
+        except (OSError, subprocess.SubprocessError, ValueError):
             return Reading("OTHER", {}, method, "TECHNICAL", "Local image reader unavailable")
     found = {kind: read_labels(pages, kind) for kind in FIELDS}
     likely = [kind for kind, values in found.items() if ("gstin" if kind == "GST" else "pan") in values]
@@ -105,6 +158,8 @@ def local_read(data, mime):
 
 def make_document(upload: Upload, case_id: str, revision: int):
     name = PurePath(upload.filename.replace("\\", "/")).name
+    if name in {"", ".", ".."} or any(ord(c) < 32 or ord(c) == 127 for c in name):
+        raise Problem(422, "Supply a valid document filename.")
     fields = {}
     status = "READY"
     if upload.fields is not None:
@@ -126,14 +181,21 @@ def make_document(upload: Upload, case_id: str, revision: int):
         if data.startswith(b"%PDF-"):
             mime = "application/pdf"
             try:
-                reader = PdfReader(BytesIO(data))
-                if reader.is_encrypted or len(reader.pages) > 8:
+                info = document_tool(["pdfinfo", "-"], data, seconds=4, output_limit=65_536)
+                pages = re.search(rb"^Pages:\s*(\d+)\s*$", info, re.M)
+                if (
+                    not pages
+                    or not 1 <= int(pages[1]) <= 8
+                    or re.search(rb"^Encrypted:\s+yes", info, re.M)
+                ):
                     raise Problem(422, "Use an unlocked PDF with at most eight pages.")
-            except (PyPdfError, ValueError, KeyError, TypeError, IndexError):
-                status = "UNREADABLE"
+            except OSError:
+                raise Problem(503, "The PDF reader is unavailable.") from None
+            except (subprocess.SubprocessError, ValueError):
+                raise Problem(422, "Use a readable, unlocked PDF within the document limits.") from None
         else:
             try:
-                with Image.open(BytesIO(data)) as img:
+                with Image.open(BytesIO(data), formats=("PNG", "JPEG", "WEBP")) as img:
                     mime = {"PNG": "image/png", "JPEG": "image/jpeg", "WEBP": "image/webp"}.get(
                         img.format
                     )
@@ -141,6 +203,8 @@ def make_document(upload: Upload, case_id: str, revision: int):
                         raise Problem(422, "Supported image formats are PNG, JPEG and WebP.")
                     if img.width * img.height > 10_000_000:
                         raise Problem(422, "Use a scan under ten megapixels.")
+                    if getattr(img, "is_animated", False):
+                        raise Problem(422, "Upload a single-page still image.")
                     img.verify()
             except (UnidentifiedImageError, OSError, SyntaxError, Image.DecompressionBombError):
                 raise Problem(422, "Use a readable PDF, PNG, JPEG, WebP or structured JSON document.")

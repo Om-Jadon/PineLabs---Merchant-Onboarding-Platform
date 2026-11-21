@@ -1,6 +1,7 @@
 import os
 import uuid
 from datetime import datetime
+from pathlib import Path
 
 from sqlalchemy import (
     JSON,
@@ -14,8 +15,9 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
+from sqlalchemy.engine import make_url
 
-from .settings import now
+from .settings import key_material, now
 
 
 def uid():
@@ -46,6 +48,7 @@ class Case(Base):
     reason: Mapped[str] = mapped_column(default="Reading submitted evidence")
     requested_kind: Mapped[str | None]
     request_note: Mapped[str | None]
+    requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     issuance: Mapped[str] = mapped_column(default="NOT_STARTED")
     mid: Mapped[str | None] = mapped_column(unique=True)
     version: Mapped[int] = mapped_column(default=1)
@@ -90,7 +93,7 @@ class Attempt(Base):
     reason: Mapped[str] = mapped_column(default="Waiting for provider callback")
     provider_ref: Mapped[str | None]
     created_at: Mapped[datetime] = instant()
-    deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class Event(Base):
@@ -140,6 +143,8 @@ class Delivery(Base):
     due: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     delivered: Mapped[bool] = mapped_column(default=False)
     tries: Mapped[int] = mapped_column(default=0)
+    failure: Mapped[str | None]
+    request_digest: Mapped[str | None]
 
 
 class Merchant(Base):
@@ -149,9 +154,10 @@ class Merchant(Base):
     mid: Mapped[str] = mapped_column(unique=True)
 
 
-engine = create_engine(
-    os.getenv("DATABASE_URL", "postgresql+psycopg://merchant:demo-local@localhost/merchant"),
-    pool_pre_ping=True,
-    hide_parameters=True,
+database_url = make_url(
+    os.getenv("DATABASE_URL", "postgresql+psycopg://desk_workflow@localhost/merchant")
 )
+if database_login := os.getenv("DATABASE_LOGIN_FILE"):
+    database_url = database_url.set(password=key_material(Path(database_login), read_only=True).hex())
+engine = create_engine(database_url, pool_pre_ping=True, hide_parameters=True)
 Session = sessionmaker(engine, expire_on_commit=False)

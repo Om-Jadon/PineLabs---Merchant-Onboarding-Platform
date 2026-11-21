@@ -1,9 +1,12 @@
 import base64
 import os
+import re
+import subprocess
 from typing import Literal
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from .contracts import Text
 
 from .evidence import FIELDS, Reading, local_read, normalize, pdf_text
 
@@ -22,9 +25,9 @@ exist, set uncertain to true and value to null. Never reconstruct missing charac
 class Candidate(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     name: Literal["legal_name", "holder_name", "pan", "gstin"]
-    value: str | None = Field(max_length=250)
+    value: Text | None = Field(max_length=250)
     page: int = Field(ge=1, le=8)
-    quote: str = Field(max_length=400)
+    quote: Text = Field(max_length=400)
     uncertain: bool
 
 
@@ -72,11 +75,22 @@ def read_gemini(data: bytes, mime: str, key: str, post=httpx.post):
     except (AttributeError, KeyError, IndexError, TypeError, ValueError, ValidationError):
         raise ReaderUnavailable("Gemini returned no usable structured reading") from None
 
-    model_version = answer.get("modelVersion") or MODEL
+    version = answer.get("modelVersion")
+    model_version = (
+        version
+        if isinstance(version, str)
+        and version.isascii()
+        and version.isprintable()
+        and len(version) <= 100
+        else MODEL
+    )
     method = f"Gemini · {model_version}"
     if result.document_type not in FIELDS:
         return Reading(result.document_type, {}, method, "CONFLICT", "Document type needs review")
-    pages = pdf_text(data) if mime == "application/pdf" else [""]
+    try:
+        pages = pdf_text(data) if mime == "application/pdf" else [""]
+    except (OSError, ValueError, subprocess.SubprocessError):
+        raise ReaderUnavailable("Unable to verify the cited PDF page") from None
     values = {}
     for item in result.fields:
         if item.name not in FIELDS[result.document_type] or item.page > len(pages):
@@ -87,7 +101,12 @@ def read_gemini(data: bytes, mime: str, key: str, post=httpx.post):
         text = normalize(pages[item.page - 1])
         value, quote = normalize(item.value or ""), normalize(item.quote)
         duplicate = item.name in values
-        unsupported = value and (value not in quote or (text and quote not in text))
+        if item.name in {"pan", "gstin"}:
+            token = rf"(?<![A-Z0-9]){re.escape(value)}(?![A-Z0-9])"
+            supported = bool(re.search(token, quote)) and (not text or bool(re.search(token, text)))
+        else:
+            supported = value in quote
+        unsupported = value and (not supported or (text and quote not in text))
         unclear = item.uncertain or not value or unsupported or duplicate
         values[item.name] = {
             "value": "" if unclear else item.value,

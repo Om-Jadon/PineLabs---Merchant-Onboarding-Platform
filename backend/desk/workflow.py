@@ -106,13 +106,66 @@ def new_attempt(db, case, kind, key, retry=0):
         fingerprint=key,
         number=last + 1,
         retry=retry,
-        deadline=now() + timedelta(seconds=CHECK_TIMEOUT),
     )
     db.add(a)
     enqueue(db, case, "dispatch", a.id, "dispatch/" + a.id)
-    enqueue(db, case, "timeout", a.id, "timeout/" + a.id, a.deadline)
     record(db, case, "Workflow", f"{kind} verification queued", f"Attempt {a.number}", a.id)
     return a
+
+
+def begin_dispatch(db, case, attempt):
+    if not attempt.is_current or attempt.status != "PENDING" or case.state in TERMINAL:
+        return False
+    if attempt.deadline is None:
+        attempt.deadline = now() + timedelta(seconds=CHECK_TIMEOUT)
+        db.execute(
+            insert(Job)
+            .values(
+                case_id=case.id,
+                kind="timeout",
+                source=attempt.id,
+                operation_key="timeout/" + attempt.id,
+                at=attempt.deadline,
+            )
+            .on_conflict_do_update(
+                index_elements=["operation_key"],
+                set_={
+                    "at": attempt.deadline,
+                    "status": "READY",
+                    "lease_token": None,
+                    "lease_until": None,
+                },
+            )
+        )
+    return now() < attempt.deadline
+
+
+def awaiting_replacement(db, case, docs, loose):
+    kind = case.requested_kind
+    wanted = docs.get(kind)
+    incoming = [d for d in [*loose, wanted] if d is not None and d.created_at >= case.requested_at]
+    if (
+        wanted in incoming
+        and wanted.status == "READY"
+        and all(row["status"] == "matched" for row in compare(case, docs) if row["kind"] == kind)
+    ):
+        record(
+            db,
+            case,
+            "Workflow",
+            f"Requested {kind} evidence received",
+            f"Revision {wanted.revision}",
+            wanted.id,
+        )
+        case.requested_kind = case.request_note = case.requested_at = None
+        return False
+    if any(d.status in {"TECHNICAL", "CONFLICT"} for d in incoming):
+        change_state(db, case, "IN_REVIEW", f"Replacement {kind} evidence needs review")
+    elif any(d.status == "PENDING" for d in incoming):
+        change_state(db, case, "SUBMITTED", "Reading replacement evidence")
+    else:
+        change_state(db, case, "NEEDS_INFO", f"Current {kind} evidence requested")
+    return True
 
 
 def derive(db, case):
@@ -129,10 +182,9 @@ def derive(db, case):
                 db, case, "Workflow", f"{kind} evidence changed", f"Attempt {a.number} superseded", a.id
             )
     db.flush()
-    if case.requested_kind:
-        change_state(db, case, "NEEDS_INFO", f"Current {case.requested_kind} evidence requested")
-        return
     loose = unclassified(db, case)
+    if case.requested_kind and awaiting_replacement(db, case, docs, loose):
+        return
     incomplete = next((d for d in loose if d.status != "PENDING"), None)
     if incomplete:
         needs_info = incomplete.status == "UNREADABLE"
@@ -212,6 +264,15 @@ def apply_reading(db, case, doc, reading):
         previous = known.get(reading.kind)
         if previous and previous.created_at > doc.created_at:
             doc.status = "SUPERSEDED"
+            case.version += 1
+            record(
+                db,
+                case,
+                "Document reader",
+                "Earlier evidence superseded",
+                "A newer revision is current",
+                doc.id,
+            )
             derive(db, case)
             return
         doc.kind = reading.kind
@@ -229,8 +290,6 @@ def apply_reading(db, case, doc, reading):
             "CONFLICT",
             f"Expected {doc.kind} evidence. Reader identified {reading.kind}.",
         )
-    if doc.status == "TECHNICAL" or (case.requested_kind == doc.kind and doc.status == "READY"):
-        case.requested_kind = case.request_note = None
     record(
         db,
         case,
@@ -292,17 +351,32 @@ def correct(db, case, body: Correction):
             changed.add(field)
     if not changed and not body.documents:
         raise Problem(422, "Change a declared value or attach replacement evidence.")
-    if body.documents:
-        for unresolved in unclassified(db, case):
-            unresolved.status = "SUPERSEDED"
+    loose = unclassified(db, case)
+    replacement_ids = body.replace_document_ids
+    if replacement_ids is None:
+        # Legacy clients can implicitly replace an unclassified file with the same unique filename.
+        names = {upload.filename for upload in body.documents}
+        replacement_ids = [
+            d.id
+            for d in loose
+            if d.filename in names and sum(other.filename == d.filename for other in loose) == 1
+        ]
+    targets = set(replacement_ids)
+    if (
+        len(targets) != len(replacement_ids)
+        or len(targets) > len(body.documents)
+        or not targets <= {d.id for d in loose}
+    ):
+        raise Problem(409, "Choose a current unclassified upload for each replacement.")
+    for doc in loose:
+        if doc.id in targets:
+            doc.status = "SUPERSEDED"
     attach(db, case, body.documents)
     affected = {d.kind for d in body.documents}
     if changed & {"legal_name", "pan"}:
         affected.update(case.policy)
     if "gstin" in changed:
         affected.add("GST")
-    if case.requested_kind in affected:
-        case.requested_kind = case.request_note = None
     case.version += 1
     record(db, case, "Merchant", "Correction submitted", "Rechecking " + " and ".join(sorted(affected)))
     change_state(db, case, "SUBMITTED", "Validating corrected evidence")
@@ -310,7 +384,13 @@ def correct(db, case, body: Correction):
 
 
 def expire(db, case, attempt):
-    if not attempt.is_current or attempt.status != "PENDING" or case.state in TERMINAL:
+    if (
+        not attempt.is_current
+        or attempt.status != "PENDING"
+        or case.state in TERMINAL
+        or attempt.deadline is None
+        or now() < attempt.deadline
+    ):
         return
     attempt.status = "TIMED_OUT"
     attempt.reason = f"{attempt.kind} provider callback timed out"
@@ -337,8 +417,10 @@ def receive(db, provider, body: Callback):
         raise Problem(404, "Unknown verification attempt.")
     case = locked(db, case_id)
     attempt = db.get(Attempt, body.attempt_id)
-    if attempt.provider_ref and attempt.provider_ref != body.provider_ref:
+    if body.provider_ref != (attempt.provider_ref or f"{provider}-{attempt.id}"):
         raise Problem(409, "Provider reference mismatch.")
+    if attempt.is_current and attempt.status == "PENDING" and attempt.deadline is None:
+        raise Problem(409, "Verification has not been dispatched.")
     allowed = (
         {"PAN": {"PAN_MATCH"}, "GST": {"GST_ACTIVE"}}[provider]
         if body.outcome == "PASSED"
@@ -347,8 +429,23 @@ def receive(db, provider, body: Callback):
     if body.reason not in allowed:
         raise Problem(422, "Outcome and reason are inconsistent.")
     hashed = digest(body.model_dump())
+    received = now()
+    reserved = db.scalar(
+        insert(Receipt)
+        .values(
+            provider=provider,
+            event_id=body.event_id,
+            case_id=case_id,
+            attempt_id=attempt.id,
+            disposition="received",
+            digest=hashed,
+            received_at=received,
+        )
+        .on_conflict_do_nothing(index_elements=["provider", "event_id"])
+        .returning(Receipt.event_id)
+    )
     receipt = db.get(Receipt, (provider, body.event_id))
-    if receipt:
+    if reserved is None:
         if receipt.digest != hashed:
             raise Problem(409, "Event ID already has a different result.")
         receipt.deliveries += 1
@@ -361,8 +458,9 @@ def receive(db, provider, body: Callback):
             attempt.id,
         )
         return "duplicate"
-    received = now()
-    if attempt.status == "TIMED_OUT" or (attempt.status == "PENDING" and received >= attempt.deadline):
+    if attempt.status == "TIMED_OUT" or (
+        attempt.status == "PENDING" and attempt.deadline and received >= attempt.deadline
+    ):
         disposition = "late"
         expire(db, case, attempt)
     elif not attempt.is_current or case.state in TERMINAL or attempt.status != "PENDING":
@@ -384,17 +482,7 @@ def receive(db, provider, body: Callback):
             attempt.id,
         )
         derive(db, case)
-    db.add(
-        Receipt(
-            provider=provider,
-            event_id=body.event_id,
-            case_id=case.id,
-            attempt_id=attempt.id,
-            disposition=disposition,
-            digest=hashed,
-            received_at=received,
-        )
-    )
+    receipt.disposition = disposition
     if disposition != "applied":
         record(
             db,
@@ -431,6 +519,7 @@ def act(db, case, body: Action):
     elif body.action == "request_info":
         case.requested_kind = body.kind or "GST"
         case.request_note = redact(body.reason)
+        case.requested_at = now()
         record(db, case, "Operator", f"Current {case.requested_kind} evidence requested", body.reason)
         derive(db, case)
     else:

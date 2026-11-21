@@ -1,24 +1,25 @@
 import base64
 import hmac
 import json
-import subprocess
 from contextlib import asynccontextmanager
-from typing import Literal
+from typing import Annotated, Literal
 from urllib.parse import quote
 
 import httpx
-from fastapi import Depends, FastAPI, Request, Response
+from fastapi import Depends, FastAPI, Path, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from itsdangerous import BadSignature, URLSafeTimedSerializer
 from pydantic import BaseModel, ValidationError
 from sqlalchemy import select, text
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from . import workflow as wf
-from .contracts import Action, Callback, Correction, Submission, Upload
+from .contracts import Action, Callback, Correction, Submission, Text, Upload
 from .db import Case, Document, Receipt, Session
-from .evidence import Problem
+from .evidence import Problem, preview_pdf
+from .http_boundary import HttpBoundary
 from .settings import (
     FIXTURES,
     LEGAL_NAME,
@@ -47,6 +48,9 @@ FILES = {
     "gst-scan-obscured.png",
     "registry-letter.jpg",
 }
+RecordId = Annotated[
+    str, Path(pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+]
 
 
 def seed():
@@ -85,11 +89,15 @@ def seed():
 
 @asynccontextmanager
 async def lifespan(_):
+    for purpose in ("session", "simulator", "webhook/PAN"):
+        secret(purpose)
     seed()
     yield
 
 
 app = FastAPI(title="Merchant desk API", version="1.0", lifespan=lifespan)
+app.add_middleware(HttpBoundary)
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1", "api"])
 
 
 @app.exception_handler(Problem)
@@ -100,7 +108,8 @@ async def problem(_, exc):
 @app.exception_handler(RequestValidationError)
 async def bad_input(_, exc):
     errors = [" / ".join(str(x) for x in e["loc"][1:]) + " · " + e["msg"] for e in exc.errors()]
-    return JSONResponse({"detail": " | ".join(errors)[:700]}, status_code=422)
+    detail = " | ".join(errors[:5])[:700].encode("utf-8", errors="replace").decode()
+    return JSONResponse({"detail": detail}, status_code=422)
 
 
 def signer():
@@ -131,7 +140,7 @@ def session_info(request: Request, response: Response):
     try:
         return identify(request)
     except Problem:
-        return set_persona(response, "operator")
+        return set_persona(response, "merchant" if "desk_session" in request.cookies else "operator")
 
 
 @app.post("/api/demo/session")
@@ -199,15 +208,15 @@ def my_cases(user=Depends(merchant)):
 
 
 @app.get("/api/applications/{case_id}")
-def case_details(case_id: str, user=Depends(identify)):
+def case_details(case_id: RecordId, user=Depends(identify)):
     with Session() as db:
-        case = db.get(Case, case_id)
+        case = db.get(Case, case_id, with_for_update={"read": True})
         check_access(case, user)
         return detail(db, case, user["role"] == "operator")
 
 
 @app.post("/api/applications/{case_id}/corrections")
-def correction(case_id: str, body: Correction, user=Depends(merchant)):
+def correction(case_id: RecordId, body: Correction, user=Depends(merchant)):
     with Session.begin() as db:
         case = wf.locked(db, case_id)
         check_access(case, user)
@@ -225,13 +234,14 @@ def document_data(case_id, doc_id, user):
 
 
 @app.get("/api/applications/{case_id}/documents/{doc_id}")
-def source(case_id: str, doc_id: str, user=Depends(identify)):
+def source(case_id: RecordId, doc_id: RecordId, user=Depends(identify)):
     data, mime, name = document_data(case_id, doc_id, user)
     return Response(
         data,
         media_type=mime,
         headers={
-            "Content-Disposition": "inline; filename*=UTF-8''" + quote(name, safe=""),
+            "Content-Disposition": "attachment; filename*=UTF-8''" + quote(name, safe=""),
+            "Content-Security-Policy": "sandbox; default-src 'none'; frame-ancestors 'none'",
             "Cache-Control": "no-store",
             "X-Content-Type-Options": "nosniff",
         },
@@ -239,40 +249,21 @@ def source(case_id: str, doc_id: str, user=Depends(identify)):
 
 
 @app.get("/api/applications/{case_id}/documents/{doc_id}/preview")
-def preview(case_id: str, doc_id: str, page: int = 1, user=Depends(identify)):
+def preview(case_id: RecordId, doc_id: RecordId, page: int = 1, user=Depends(identify)):
     data, mime, _ = document_data(case_id, doc_id, user)
     if mime == "application/pdf":
         if page < 1 or page > 8:
             raise Problem(422, "Invalid page.")
-        try:
-            run = subprocess.run(
-                [
-                    "pdftoppm",
-                    "-f",
-                    str(page),
-                    "-l",
-                    str(page),
-                    "-singlefile",
-                    "-scale-to",
-                    "1000",
-                    "-png",
-                    "-",
-                ],
-                input=data,
-                capture_output=True,
-                timeout=8,
-                check=True,
-            )
-            data, mime = run.stdout, "image/png"
-        except (OSError, subprocess.SubprocessError):
-            raise Problem(422, "Preview unavailable. Open the original document.")
+        data, mime = preview_pdf(data, page), "image/png"
+    elif page != 1:
+        raise Problem(422, "An image has one page.")
     if not mime.startswith("image/") or not data:
         raise Problem(422, "This document has no image preview.")
     return Response(data, media_type=mime, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/operator/cases", dependencies=[Depends(operator)])
-def queue(state: str | None = None):
+def queue(state: Annotated[Text | None, Query(max_length=32)] = None):
     with Session() as db:
         query = select(Case).order_by(Case.created_at.desc())
         if state:
@@ -281,16 +272,16 @@ def queue(state: str | None = None):
 
 
 @app.get("/api/operator/cases/{case_id}", dependencies=[Depends(operator)])
-def operator_case(case_id: str):
+def operator_case(case_id: RecordId):
     with Session() as db:
-        case = db.get(Case, case_id)
+        case = db.get(Case, case_id, with_for_update={"read": True})
         if not case:
             raise Problem(404, "Application not found.")
         return detail(db, case, True)
 
 
 @app.post("/api/operator/cases/{case_id}/actions", dependencies=[Depends(operator)])
-def act(case_id: str, body: Action):
+def act(case_id: RecordId, body: Action):
     with Session.begin() as db:
         case = wf.locked(db, case_id)
         wf.act(db, case, body)
@@ -298,7 +289,7 @@ def act(case_id: str, body: Action):
 
 
 @app.post("/api/operator/cases/{case_id}/replay", status_code=202, dependencies=[Depends(operator)])
-def replay(case_id: str):
+def replay(case_id: RecordId):
     with Session() as db:
         receipt = db.scalar(
             select(Receipt)
@@ -319,20 +310,24 @@ def replay(case_id: str):
     return {"queued": True}
 
 
-@app.post("/api/webhooks/{provider}")
-async def webhook(provider: str, request: Request):
+async def signed_callback(provider: str, request: Request):
     provider = provider.upper()
     raw = await request.body()
     if provider not in {"PAN", "GST"} or not hmac.compare_digest(
-        request.headers.get("X-Webhook-Signature", ""), sign(provider, raw)
+        request.headers.get("X-Webhook-Signature", "").encode("latin-1"),
+        sign(provider, raw).encode("ascii"),
     ):
         raise Problem(401, "Invalid provider signature.")
     try:
-        body = Callback.model_validate_json(raw)
+        return Callback.model_validate_json(raw)
     except ValidationError:
         raise Problem(422, "Invalid callback payload.")
+
+
+@app.post("/api/webhooks/{provider}")
+def webhook(provider: str, body: Callback = Depends(signed_callback)):
     with Session.begin() as db:
-        return {"disposition": wf.receive(db, provider, body)}
+        return {"disposition": wf.receive(db, provider.upper(), body)}
 
 
 if STATIC.is_dir():

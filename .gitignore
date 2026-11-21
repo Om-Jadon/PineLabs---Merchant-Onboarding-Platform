@@ -10,6 +10,15 @@ node_modules/
 dist/
 *.tsbuildinfo
 .local/
+# Local case-study preparation
+/DEVELOPMENT_PLAN.md
+/PS.md
+/docs/HARDENING_AUDIT.md
+/docs/merchant-onboarding-demo.mp4
+
+/.vscode/
+/.aws/
+/.agents/
+/.codex/
 playwright-report/
 test-results/
-/docs/merchant-onboarding-demo.mp4

@@ -1,9 +1,12 @@
 import base64
 import json
 import shutil
+from io import BytesIO
 
 import httpx
 import pytest
+from PIL import Image
+from pydantic import ValidationError
 
 from desk import gemini
 from desk.contracts import Upload
@@ -176,3 +179,50 @@ def test_file_signature_and_structured_source():
     assert structured.fields["pan"]["source"] == "$.pan"
     with pytest.raises(Problem):
         make_document(Upload(filename="scan.png", content_base64="notbase64"), "test", 1)
+
+
+def test_identifier_is_a_complete_token_in_source(monkeypatch):
+    candidates = fields()
+    candidates[1]["quote"] = NEW_GST
+    monkeypatch.setattr(gemini, "pdf_text", lambda data: [LEGAL_NAME + " " + NEW_GST + "0"])
+    reading = gemini.read_gemini(
+        b"fixture", "application/pdf", "test", lambda *a, **k: response(readings=candidates)
+    )
+    assert compare_reading(reading)["gstin"] == "conflicting"
+
+
+def test_unsupported_document_pages_and_multiframe_image_are_refused(monkeypatch):
+    from desk import evidence
+
+    pdf = upload("gst-current.pdf")
+    for summary in (b"Pages: 9\nEncrypted: no\n", b"Pages: 1\nEncrypted: yes\n"):
+        monkeypatch.setattr(evidence, "document_tool", lambda *a, **k: summary)
+        with pytest.raises(Problem, match="unlocked PDF"):
+            make_document(pdf, "test", 1)
+    buffer = BytesIO()
+    Image.new("RGB", (2, 2), "red").save(
+        buffer, format="PNG", save_all=True, append_images=[Image.new("RGB", (2, 2), "blue")]
+    )
+    frames = Upload(
+        filename="two-frames.png", content_base64=base64.b64encode(buffer.getvalue()).decode()
+    )
+    with pytest.raises(Problem, match="still image"):
+        make_document(frames, "test", 1)
+
+
+def test_invalid_database_text_fails_input_validation():
+    with pytest.raises(ValidationError):
+        Upload(kind="PAN", filename="pan.json", fields={"pan": PAN + chr(0)})
+
+
+def test_parser_does_not_inherit_service_credentials(monkeypatch):
+    from desk import evidence
+
+    def run(command, **kwargs):
+        assert command[0] == "prlimit" and not kwargs["env"].get("GEMINI_API_KEY")
+        assert set(kwargs["env"]) == {"PATH", "LC_ALL", "OMP_THREAD_LIMIT"}
+        kwargs["stdout"].write(b"fixture")
+
+    monkeypatch.setenv("GEMINI_API_KEY", "unit-test-only")
+    monkeypatch.setattr(evidence.subprocess, "run", run)
+    assert evidence.document_tool(["pdfinfo", "-"], b"", seconds=1, output_limit=8) == b"fixture"

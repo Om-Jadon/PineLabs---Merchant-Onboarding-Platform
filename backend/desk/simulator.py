@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import hmac
 import json
 from contextlib import asynccontextmanager, suppress
@@ -12,11 +13,12 @@ from sqlalchemy.dialects.postgresql import insert
 from .contracts import IssueInput, VerifyInput
 from .db import Delivery, Merchant, Session, uid
 from .evidence import normalize
+from .http_boundary import HttpBoundary
 from .settings import CALLBACK_URL, CHECK_TIMEOUT, LEGAL_NAME, NEW_GST, OLD_GST, PAN, now, secret, sign
 
 
 def internal(key: str = Header("", alias="X-Simulator-Key")):
-    if not hmac.compare_digest(key, secret("simulator").hex()):
+    if not hmac.compare_digest(key.encode("latin-1"), secret("simulator").hex().encode("ascii")):
         raise HTTPException(403, "Simulator credentials required.")
 
 
@@ -24,7 +26,7 @@ def deliver_one():
     with Session.begin() as db:
         row = db.scalar(
             select(Delivery)
-            .where(~Delivery.delivered, Delivery.due <= now())
+            .where(~Delivery.delivered, Delivery.failure.is_(None), Delivery.due <= now())
             .order_by(Delivery.due)
             .limit(1)
             .with_for_update(skip_locked=True)
@@ -32,9 +34,11 @@ def deliver_one():
         if row is None:
             return False
         row.tries += 1
-        row.due = now() + timedelta(seconds=min(30, 2 ** min(row.tries, 5)))
-        attempt_id, provider, payload = row.attempt_id, row.provider, row.payload
+        row.due = now() + timedelta(seconds=30)
+        attempt_id, provider, payload, claimed_due = row.attempt_id, row.provider, row.payload, row.due
     content = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    failure = None
+    permanent = False
     try:
         response = httpx.post(
             f"{CALLBACK_URL}/api/webhooks/{provider.lower()}",
@@ -43,11 +47,21 @@ def deliver_one():
             headers={"content-type": "application/json", "X-Webhook-Signature": sign(provider, content)},
         )
         response.raise_for_status()
-    except httpx.HTTPError:
-        return True
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        failure = f"HTTP {status}"
+        permanent = 400 <= status < 500 and status not in (408, 429)
+    except httpx.RequestError:
+        failure = "Connection unavailable"
     with Session.begin() as db:
         row = db.get(Delivery, attempt_id, with_for_update=True)
-        row.delivered = True
+        if row.due == claimed_due:
+            if failure is None:
+                row.delivered = True
+            elif permanent or row.tries >= 6:
+                row.failure = failure
+            else:
+                row.due = now() + timedelta(seconds=min(30, 2**row.tries))
     return True
 
 
@@ -73,6 +87,7 @@ async def lifespan(_):
 
 
 app = FastAPI(title="Local provider simulator", lifespan=lifespan)
+app.add_middleware(HttpBoundary)
 
 
 @app.get("/health")
@@ -103,6 +118,7 @@ def verify(provider: str, body: VerifyInput):
     delay = 1 if kind == "PAN" else 3
     if body.scenario == "late_callback" and kind == "GST" and body.number == 1:
         delay = CHECK_TIMEOUT + 2
+    request_digest = hashlib.sha256(body.model_dump_json().encode()).hexdigest()
     with Session.begin() as db:
         db.execute(
             insert(Delivery)
@@ -110,13 +126,16 @@ def verify(provider: str, body: VerifyInput):
                 attempt_id=body.attempt_id,
                 provider=kind,
                 payload=payload,
+                request_digest=request_digest,
                 due=now() + timedelta(seconds=delay),
             )
             .on_conflict_do_nothing(index_elements=["attempt_id"])
         )
         row = db.get(Delivery, body.attempt_id)
-        if row.provider != kind:
-            raise HTTPException(409, "Attempt belongs to another provider.")
+        if row.provider != kind or (
+            row.request_digest is not None and row.request_digest != request_digest
+        ):
+            raise HTTPException(409, "Attempt already belongs to a different verification request.")
         return {"provider_ref": row.payload["provider_ref"]}
 
 
@@ -141,5 +160,5 @@ def replay(attempt_id: str):
         row = db.get(Delivery, attempt_id, with_for_update=True)
         if not row:
             raise HTTPException(404)
-        row.delivered, row.due = False, now()
+        row.delivered, row.failure, row.tries, row.due = False, None, 0, now()
     return {"queued": True}

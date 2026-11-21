@@ -1,6 +1,11 @@
 .git
+.aws
+.agents
+.codex
 .env
 **/.env*
+DEVELOPMENT_PLAN.md
+PS.md
 .venv
 .local
 .ruff_cache

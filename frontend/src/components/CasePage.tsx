@@ -10,7 +10,7 @@ import {
   ChevronDown,
   CircleCheck,
   Clock3,
-  ExternalLink,
+  Download,
   FileSearch,
   FileText,
   Fingerprint,
@@ -33,6 +33,7 @@ import {
 } from "@/components/ui/dialog"
 import {
   api,
+  ApiError,
   dateTime,
   elapsed,
   go,
@@ -58,7 +59,7 @@ const tabs = [
 ]
 
 function blockerInfo(c: CaseDetail) {
-  if (c.request_note) return c.request_note
+  if (c.state === "NEEDS_INFO" && c.request_note) return c.request_note
   if (c.reason === "GST registration inactive")
     return "The GSTIN matches the submitted evidence. The simulated registry reports that this registration is inactive."
   if (c.state === "ACTIVE")
@@ -81,21 +82,19 @@ function ActionModal({
   c,
   onClose,
   onSaved,
+  refresh,
 }: {
   name: string
   c: CaseDetail
   onClose: () => void
   onSaved: () => void
+  refresh: () => void
 }) {
   const preferred: Kind = c.reason.startsWith("PAN") ? "PAN" : "GST"
   const [kind, setKind] = useState<Kind>(preferred)
-  const [reason, setReason] = useState(
-    name === "request_info"
-      ? "Please supply a current " +
-          preferred +
-          " document and update the corresponding details."
-      : "",
-  )
+  const requestText = (kind: Kind) => `Please supply a current ${kind} document and update the corresponding details.`
+  const [reason, setReason] = useState(name === "request_info" ? requestText(preferred) : "")
+  const [stale, setStale] = useState(false)
   const [version] = useState(c.version)
   const [error, setError] = useState(""),
     [busy, setBusy] = useState(false)
@@ -119,6 +118,7 @@ function ActionModal({
       onClose()
     } catch (err) {
       setError(message(err))
+      setStale(err instanceof ApiError && err.status === 409)
       setBusy(false)
     }
   }
@@ -146,7 +146,11 @@ function ActionModal({
               Requested evidence
               <select
                 value={kind}
-                onChange={(e) => setKind(e.target.value as Kind)}
+                onChange={(e) => {
+                  const next = e.target.value as Kind
+                  if (reason === requestText(kind)) setReason(requestText(next))
+                  setKind(next)
+                }}
               >
                 <option>PAN</option>
                 <option>GST</option>
@@ -164,12 +168,13 @@ function ActionModal({
             />
           </label>
           {error && <ErrorNotice text={error} />}
+          {stale && <Button type="button" variant="outline" onClick={() => { onClose(); refresh() }}>Reload current case</Button>}
           <DialogFooter>
             <Button type="button" variant="outline" onClick={onClose}>
               Cancel
             </Button>
             <Button
-              disabled={busy || !reason.trim()}
+              disabled={busy || stale || !reason.trim()}
               variant={name === "reject" ? "destructive" : "default"}
             >
               {busy
@@ -245,8 +250,8 @@ function EvidencePanel({
           <div className="empty">
             <FileSearch />
             <p>Preview unavailable</p>
-            <a href={href} target="_blank" rel="noreferrer">
-              Open original document
+            <a href={href} download>
+              Download original document
             </a>
           </div>
         ) : (
@@ -270,13 +275,12 @@ function EvidencePanel({
           {doc && (
             <a
               className="icon-link"
-              title="Open original document"
-              aria-label="Open original document"
+              title="Download original document"
+              aria-label="Download original document"
               href={href}
-              target="_blank"
-              rel="noreferrer"
+              download
             >
-              <ExternalLink />
+              <Download />
             </a>
           )}
         </div>
@@ -326,10 +330,9 @@ function EvidencePanel({
                 <a
                   className="text-button"
                   href={href}
-                  target="_blank"
-                  rel="noreferrer"
+                  download
                 >
-                  Open original file <ExternalLink size={14} />
+                  Download original file <Download size={14} />
                 </a>
               </DialogContent>
             </Dialog>
@@ -470,7 +473,7 @@ function Verification({
         {c.receipts.length ? (
           <>
             {[...c.receipts].reverse().map((r) => (
-              <div className="receipt" key={r.event_id}>
+              <div className="receipt" key={r.kind + "/" + r.event_id}>
                 <div>
                   <strong>{r.kind} callback</strong>
                   <small>
@@ -527,6 +530,8 @@ export function CasePage({ id, persona, openAs }: Props) {
     attention = ["IN_REVIEW", "NEEDS_INFO", "REJECTED"].includes(c.state)
   const doc =
     c.documents.find((d) => d.id === selected) ||
+    c.documents.find((d) => d.current && d.kind === "AUTO") ||
+    c.documents.find((d) => d.current && d.kind === (c.requested_kind || c.fields.find((f) => f.status !== "matched")?.kind)) ||
     c.documents.find((d) => d.current && d.kind === "GST") ||
     c.documents.find((d) => d.current)
   const Icon = done ? CircleCheck : attention ? AlertCircle : Clock3
@@ -713,6 +718,7 @@ export function CasePage({ id, persona, openAs }: Props) {
           name={action}
           c={c}
           onClose={() => setAction("")}
+          refresh={reload}
           onSaved={() => {
             setNotice("Action recorded in case activity.")
             reload()

@@ -52,7 +52,7 @@ export interface Attempt {
   status: string
   reason: string
   current: boolean
-  deadline: string
+  deadline: string | null
   created_at: string
   provider_ref: string | null
 }
@@ -106,6 +106,12 @@ export interface Upload {
   content_base64?: string
 }
 
+export class ApiError extends Error {
+  constructor(public status: number, detail: string) {
+    super(detail)
+  }
+}
+
 export async function api<T>(
   path: string,
   body?: unknown,
@@ -124,8 +130,9 @@ export async function api<T>(
   })
   const value = await response.json().catch(() => null)
   if (!response.ok)
-    throw new Error(
-      value?.detail || "The service could not complete this request.",
+    throw new ApiError(
+      response.status,
+      typeof value?.detail === "string" ? value.detail : "The service could not complete this request.",
     )
   return value as T
 }
@@ -141,18 +148,22 @@ export function useResource<T>(path: string, poll = false) {
     const abort = new AbortController()
     let timer: ReturnType<typeof setTimeout>
     async function load() {
+      let refresh = poll
       try {
         const data = await api<T>(path, undefined, abort.signal)
         if (!abort.signal.aborted) setState({ path, data })
       } catch (err) {
-        if (!abort.signal.aborted)
+        if (!abort.signal.aborted) {
+          const lostAccess = err instanceof ApiError && [401, 403, 404].includes(err.status)
+          if (lostAccess) refresh = false
           setState((old) => ({
-            ...(old.path === path ? old : {}),
+            ...(old.path === path && !lostAccess ? old : {}),
             path,
             error: message(err),
           }))
+        }
       } finally {
-        if (poll && !abort.signal.aborted) timer = setTimeout(load, 1500)
+        if (refresh && !abort.signal.aborted) timer = setTimeout(load, 1500)
       }
     }
     void load()
