@@ -1,6 +1,5 @@
 import base64
 import hmac
-import json
 from contextlib import asynccontextmanager
 from typing import Annotated, Literal
 from urllib.parse import quote
@@ -22,6 +21,7 @@ from .evidence import Problem, preview_pdf
 from .http_boundary import HttpBoundary
 from .settings import (
     FIXTURES,
+    IMAGE_APPLICATION,
     LEGAL_NAME,
     NEW_GST,
     OLD_GST,
@@ -39,15 +39,9 @@ PERSONAS = {
     "merchant": {"role": "merchant", "owner": "riverbend", "name": LEGAL_NAME},
     "other_merchant": {"role": "merchant", "owner": "second-merchant", "name": "Second demo merchant"},
 }
-FILES = {
-    "pan.json",
-    "gst-inactive.pdf",
-    "gst-current.pdf",
-    "gst-scan.png",
-    "gst-scan-alternate.png",
-    "gst-scan-obscured.png",
-    "registry-letter.jpg",
-}
+REVIEW_FILES = ("pan.png", "gst-cert.png")
+CLEAN_FILES = ("pan-stat.png", "gst-stationary.png")
+FILES = REVIEW_FILES + CLEAN_FILES
 RecordId = Annotated[
     str, Path(pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 ]
@@ -57,7 +51,7 @@ def seed():
     with Session.begin() as db:
         if db.scalar(
             select(Case.id).where(
-                Case.owner == "riverbend", Case.submission_key == "riverbend-introduction"
+                Case.owner == "riverbend", Case.submission_key == "specimen-images-v1"
             )
         ):
             return
@@ -65,23 +59,14 @@ def seed():
             db,
             "riverbend",
             Submission(
-                submission_key="riverbend-introduction",
-                legal_name=LEGAL_NAME,
-                pan=PAN,
-                gstin=OLD_GST,
+                submission_key="specimen-images-v1",
+                **IMAGE_APPLICATION,
                 documents=[
                     Upload(
-                        kind="PAN",
-                        filename="pan.json",
-                        fields=json.loads((FIXTURES / "pan.json").read_text()),
-                    ),
-                    Upload(
-                        kind="GST",
-                        filename="gst-inactive.pdf",
-                        content_base64=base64.b64encode(
-                            (FIXTURES / "gst-inactive.pdf").read_bytes()
-                        ).decode(),
-                    ),
+                        filename=name,
+                        content_base64=base64.b64encode((FIXTURES / name).read_bytes()).decode(),
+                    )
+                    for name in REVIEW_FILES
                 ],
             ),
         )
@@ -179,7 +164,14 @@ def fixtures():
         "pan": PAN,
         "old_gstin": OLD_GST,
         "current_gstin": NEW_GST,
-        "files": sorted(FILES),
+        "image_samples": {
+            "clean": {
+                "declared": {"legal_name": LEGAL_NAME, "pan": PAN, "gstin": NEW_GST},
+                "files": CLEAN_FILES,
+            },
+            "review": {"declared": IMAGE_APPLICATION, "files": REVIEW_FILES},
+        },
+        "files": FILES,
     }
 
 

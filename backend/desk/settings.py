@@ -20,6 +20,12 @@ LEGAL_NAME = "Riverbend Stationery"
 PAN = "DEMFR1234K"
 OLD_GST = "29DEMFR1234K1ZL"
 NEW_GST = "29DEMFR1234K2ZK"
+# Declarations printed on the two specimen images. Extraction reads the images independently.
+IMAGE_APPLICATION = {
+    "legal_name": "SAMPLE ENTERPRISES PRIVATE LIMITED",
+    "pan": "ABCDI2345F",
+    "gstin": "99DEMO1234A1Z5",
+}
 
 
 def now():

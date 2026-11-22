@@ -60,7 +60,7 @@ test("a PAN request uses a matching message and replacement sample", async ({ pa
   await page.getByRole("button", { name: "Send request" }).click()
   await page.getByRole("button", { name: "Open merchant correction" }).click()
   await page.getByRole("button", { name: "Load PAN record" }).click()
-  await expect(page.getByText("pan.json", { exact: true }).first()).toBeVisible()
+  await expect(page.getByText("pan-record.json", { exact: true })).toBeVisible()
   await page.getByRole("button", { name: "Submit correction" }).click()
   await expect(page.locator(".title-inline .status-pill")).toHaveText("Active")
 })

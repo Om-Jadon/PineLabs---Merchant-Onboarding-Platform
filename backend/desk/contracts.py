@@ -15,6 +15,10 @@ def database_text(value: str) -> str:
 
 Text = Annotated[str, AfterValidator(database_text)]
 
+MAX_DOCUMENT_MIB = 6
+MAX_DOCUMENT_BYTES = MAX_DOCUMENT_MIB * 1024 * 1024
+MAX_DOCUMENT_BASE64 = 4 * ((MAX_DOCUMENT_BYTES + 2) // 3)
+
 Kind = Literal["PAN", "GST"]
 Scenario = Literal["standard", "late_callback", "lost_mid_response"]
 
@@ -27,7 +31,7 @@ class Upload(Contract):
     kind: Literal["PAN", "GST", "AUTO"] = "AUTO"
     filename: Text = Field(min_length=1, max_length=120)
     fields: dict[Text, Text] | None = None
-    content_base64: str | None = Field(None, max_length=4_194_304)
+    content_base64: str | None = Field(None, max_length=MAX_DOCUMENT_BASE64)
 
     @model_validator(mode="after")
     def one_source(self):

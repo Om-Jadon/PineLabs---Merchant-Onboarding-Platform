@@ -11,7 +11,7 @@ from threading import BoundedSemaphore
 
 from PIL import Image, UnidentifiedImageError
 
-from .contracts import Upload
+from .contracts import MAX_DOCUMENT_BYTES, MAX_DOCUMENT_MIB, Upload
 from .db import Case, Document
 
 FIELDS = {"PAN": ("holder_name", "pan"), "GST": ("legal_name", "gstin")}
@@ -36,21 +36,51 @@ def normalize(value: str):
 
 def read_labels(pages: list[str], kind: str):
     result = {}
+
+    def record(key, value, page, quote):
+        previous = result.get(key)
+        if previous and (not value or normalize(previous["value"]) == normalize(value)):
+            return
+        result[key] = {
+            "value": value[:250],
+            "source": f"Page {page} · {LABELS[key]}",
+            "page": page,
+            "quote": quote[:400],
+            "unreadable": not value,
+            "ambiguous": bool(previous and previous["value"]),
+        }
+
     for page, text in enumerate(pages, 1):
-        for line in text.splitlines():
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        for line in lines:
             for key in FIELDS[kind]:
                 match = re.match(r"^\s*" + LABELS[key] + r"\s*[:\-]\s*(.+?)\s*$", line, re.I)
                 if match:
-                    candidate = {
-                        "value": match[1][:250],
-                        "source": f"Page {page} · {LABELS[key]}",
-                        "page": page,
-                    }
-                    candidate["quote"] = line.strip()[:400]
-                    if key in result and result[key]["value"] != candidate["value"]:
-                        candidate["ambiguous"] = True
-                    if key not in result or candidate.get("ambiguous"):
-                        result[key] = candidate
+                    record(key, match[1], page, line)
+
+        if kind == "GST" and re.search(r"\bGST\s+REG[\s-]*06\b", text, re.I):
+            for line in lines:
+                row = re.sub(r"^[\d.| )]+", "", line)
+                name = re.match(r"Legal Name\b[\s:|–-]+(.+)", row, re.I)
+                number = re.fullmatch(r"Registration Number\s*[:|-]?\s*([A-Z0-9]+)", row, re.I)
+                if name:
+                    record("legal_name", name[1].strip(" |"), page, line)
+                if number:
+                    record("gstin", number[1], page, line)
+
+        if kind == "PAN" and re.search(r"\bIncome Tax Department\b", text, re.I):
+            heading = next((line for line in lines if re.search(r"\bPermanent Account\b", line, re.I)), None)
+            if heading:
+                # A damaged number still belongs to this PAN card. Leave it unreadable.
+                record("pan", "", page, heading)
+                for index, line in enumerate(lines):
+                    for number in re.finditer(r"\b" + PATTERNS["pan"].pattern + r"\b", line):
+                        record("pan", number[0], page, line)
+                    if re.search(r"(?:^|/)\s*Name\b", line, re.I) and index + 1 < len(lines):
+                        printed = lines[index + 1]
+                        name = re.split(r"\.{2,}|[|_\[\]©%]", printed, maxsplit=1)[0].strip(" .")
+                        if re.fullmatch(r"[A-Za-z][A-Za-z .'-]{1,139}", name):
+                            record("holder_name", name, page, printed)
     return result
 
 
@@ -175,8 +205,8 @@ def make_document(upload: Upload, case_id: str, revision: int):
             data = base64.b64decode(upload.content_base64, validate=True)
         except (ValueError, binascii.Error):
             raise Problem(422, "The document could not be decoded.")
-        if not 0 < len(data) <= 3 * 1024 * 1024:
-            raise Problem(422, "Upload a document between 1 byte and 3 MiB.")
+        if not 0 < len(data) <= MAX_DOCUMENT_BYTES:
+            raise Problem(422, f"Upload a document between 1 byte and {MAX_DOCUMENT_MIB} MiB.")
         status, method = "PENDING", "Queued"
         if data.startswith(b"%PDF-"):
             mime = "application/pdf"

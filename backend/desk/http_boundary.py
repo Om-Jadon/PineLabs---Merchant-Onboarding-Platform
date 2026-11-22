@@ -3,9 +3,10 @@ from starlette.exceptions import HTTPException
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from .contracts import MAX_DOCUMENT_BASE64
 
 # Two maximum-size base64 uploads plus room for JSON and declared fields.
-UPLOAD_REQUEST_LIMIT = 2 * 4_194_304 + 65_536
+UPLOAD_REQUEST_LIMIT = 2 * MAX_DOCUMENT_BASE64 + 65_536
 METADATA_REQUEST_LIMIT = 16_384
 
 

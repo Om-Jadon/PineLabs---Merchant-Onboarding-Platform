@@ -249,11 +249,11 @@ def test_api_idempotency_roles_access_and_webhook_auth():
         )
 
 
-def test_unspecified_document_revisions_and_unsupported_classification():
+def test_unspecified_document_revisions_and_unsupported_classification(text_pdf):
     original = payload()
     binary = Upload(
         filename="unnamed",
-        content_base64=base64.b64encode((FIXTURES / "gst-current.pdf").read_bytes()).decode(),
+        content_base64=base64.b64encode(text_pdf).decode(),
     )
     original.documents = [original.documents[0], binary]
     case_id = application(original)
@@ -303,8 +303,8 @@ def test_technical_failure_reading_requested_replacement_can_be_retried():
             ),
         )
         binary = Upload(
-            filename="letter.jpg",
-            content_base64=base64.b64encode((FIXTURES / "registry-letter.jpg").read_bytes()).decode(),
+            filename="gst-cert.png",
+            content_base64=base64.b64encode((FIXTURES / "gst-cert.png").read_bytes()).decode(),
         )
         wf.correct(db, case, Correction(expected_version=case.version, documents=[binary]))
         doc = wf.unclassified(db, case)[0]
@@ -349,11 +349,11 @@ def test_only_matching_new_evidence_can_close_operator_request():
         assert case.state == "VERIFYING" and case.requested_kind is case.requested_at is None
 
 
-def test_replacing_one_unidentified_document_preserves_the_other():
+def test_replacing_one_unidentified_document_preserves_the_other(text_pdf):
     def binary(name):
         return Upload(
             filename=name,
-            content_base64=base64.b64encode((FIXTURES / "gst-current.pdf").read_bytes()).decode(),
+            content_base64=base64.b64encode(text_pdf).decode(),
         )
 
     submission = payload()

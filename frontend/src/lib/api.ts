@@ -97,6 +97,7 @@ export interface Samples {
   pan: string
   old_gstin: string
   current_gstin: string
+  image_samples: Record<"clean" | "review", { declared: Declared; files: string[] }>
   files: string[]
 }
 export interface Upload {

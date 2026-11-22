@@ -12,14 +12,24 @@ From the repository root, with Docker Compose available, run
 docker compose up --build --wait -d
 ```
 
-Open [Merchant desk](http://localhost:8018). The first run creates a synthetic Riverbend Stationery application. Within a few seconds its PAN check should pass and its GST check should report **GST registration inactive**. The two workspace buttons switch between the demo operator and merchant. The case, evidence and history persist across restarts.
+Open [Merchant desk](http://localhost:8018). Under **Merchant portal → New application**, choose a sample and submit. All four PNGs are available under **Download test documents**.
 
-1. Open **Evidence**. Compare the declared and extracted GSTIN. Select the source page to inspect the document that supplied it.
-2. Choose **Request current certificate**, then **Send request**. Open the merchant correction, choose **Load current certificate**, and submit.
-3. When the case becomes **Active**, open **Operator view → Verification**. The history shows one PAN attempt and two GST attempts. The active case has one merchant ID.
-4. Choose **Replay latest callback**. The receipt shows two deliveries. Refresh to see the same MID and open **Activity** to inspect the approval and issuance.
+| Sample | Evidence | What to look for |
+| --- | --- | --- |
+| **Load clean sample** | Riverbend Stationery’s `pan-stat.png` and `gst-stationary.png` | With Gemini configured, all four fields matched in the tested run. The PAN and GST callbacks both passed and the application reached **Active** with one merchant ID. |
+| **Load mismatched sample** | `pan.png` names Sample Kumar. `gst-cert.png` names Sample Enterprises Private Limited. | The holder conflicts with the declaration and the printed GSTIN has 14 characters. The application goes to **Needs review** before either provider is called. This is also the starter case. |
+| **Load inactive registration** | Structured PAN and GST records for Riverbend | PAN passes and GST reports an inactive registration. The merchant can correct it and reach approval without an API key. |
 
-To start at intake, open **Merchant portal → New application**. **Load review sample** exercises the exception. **Load clean sample** uses the active GSTIN from the outset. The simulator also offers a late first GST callback and a lost first MID response.
+Open **Evidence** to compare declarations with extracted fields and inspect their source. **Verification** shows the provider attempts and callback receipts. For the clean image demo, enable Gemini using the steps below. In the offline OCR test, the watermark interfered with the PAN holder name and the reader missed the GST legal name, which routed the case to review.
+
+### Correct an inactive GST registration
+
+1. Open **Merchant portal → New application**, choose **Load inactive registration**, and submit. In **Operator view**, the PAN check passes and the GST simulator reports **GST registration inactive**.
+2. Choose **Request current certificate → Send request**. Open the merchant correction, choose **Load current GST record**, and submit.
+3. Once the case is **Active**, open **Operator view → Verification**. The history shows one PAN attempt, two GST attempts and one merchant ID.
+4. Choose **Replay latest callback**. The receipt shows two deliveries and the MID stays the same. **Activity** shows the approval and issuance.
+
+The provider simulator also offers a late first GST callback and a lost first MID response.
 
 ## Gemini extraction
 
@@ -27,19 +37,17 @@ With a configured key, the worker sends the original PDF, PNG, JPEG or WebP to `
 
 To enable Gemini on a fresh checkout, copy `.env.example` to `.env`, set `GEMINI_API_KEY` there, then run `docker compose up -d --force-recreate worker`. Compose passes the credential to the worker. The key file is excluded from Git and Docker builds. Use synthetic evidence for this demo. Google lists standard Flash-Lite input and output under its free tier. Quotas and billing apply to the Google project that owns the key. [Google's model pricing](https://ai.google.dev/gemini-api/docs/pricing#gemini-3.5-flash-lite)
 
-On **21 November 2026**, the live alias returned `gemini-3.5-flash-lite`. The reader returned the expected legal name, GSTIN, page and quote for the unfamiliar-layout registry letter and the digital certificate. It classified an unrelated shape drawing as `OTHER` and withheld the obscured GSTIN in a scan. Each reading records the model version supplied by Google. Repeat the live smoke test on the letter and certificate with
+Each Gemini reading records the model version supplied by Google. To check its field values and source references against both pairs of specimen images, run
 
 ```sh
 docker compose exec worker python -m desk.check_gemini
 ```
 
-Open **Download test documents** on the intake or correction screen to try other layouts. For example, load a clean application, remove `gst-current.pdf`, then upload `registry-letter.jpg`. The same active registration appears in the body of a letter. `gst-scan-obscured.png` covers a character in the identifier.
-
 | Evidence | How the desk handles it |
 | --- | --- |
 | Structured JSON | Reads the supplied PAN or GST fields directly and records the JSON key as the source. |
-| Binary upload with Gemini | Accepts up to two files, each at most 3 MiB. PDFs may have up to eight pages and images up to ten megapixels. A supported type can arrive with an unfamiliar filename or layout. |
-| Missing key or provider outage | The local reader can read labelled digital PDFs and run Tesseract on labelled images. When it recovers from a provider error, the case shows the fallback method and reason. A provider failure with unusable fallback evidence needs a technical retry. |
+| Binary upload with Gemini | Accepts up to two files, each at most 6 MiB. PDFs may have up to eight pages and images up to ten megapixels. A supported type can arrive with an unfamiliar filename or layout. |
+| Missing key or provider outage | The local reader extracts labelled text from digital PDFs and runs Tesseract on images. It recognises PAN card headings and GST REG-06 registration rows. A watermarked identifier can remain unreadable. When a provider error triggers fallback, the case records the reason. |
 | Unclear or inconsistent evidence | Unknown and mixed documents go to review. Unreadable or missing fields prompt correction. A model quote must contain its candidate value. For PDFs with a text layer, the quote must also occur on the cited page. For scans, the reviewer can inspect the original pixels. |
 
 ## How a decision is made

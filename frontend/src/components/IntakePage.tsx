@@ -23,10 +23,11 @@ import {
 } from "@/lib/api"
 
 const empty: Declared = { legal_name: "", pan: "", gstin: "" }
+const maxDocumentMiB = 6
 
 async function readUpload(file: File): Promise<Upload> {
-  if (file.size > 3 * 1024 * 1024)
-    throw new Error("Each document must fit within 3 MiB.")
+  if (file.size > maxDocumentMiB * 1024 * 1024)
+    throw new Error(`Each document must fit within ${maxDocumentMiB} MiB.`)
   if (/\.json$/i.test(file.name)) {
     let fields
     try {
@@ -82,31 +83,37 @@ function Form({ initial, reload }: { initial?: CaseDetail; reload?: () => void }
   const correcting = Boolean(initial)
   const needsPan = initial?.requested_kind === "PAN"
   const unclassified = initial?.documents.filter((d) => d.current && d.kind === "AUTO") || []
-  async function loadSample(active: boolean) {
+  const registryDemo = samples && (!initial ||
+    initial.declared.legal_name.trim().toUpperCase() === samples.legal_name.toUpperCase())
+
+  async function loadImages(kind: "clean" | "review") {
     if (!samples) return
     setBusy(true)
     setError("")
     try {
-      const names = correcting
-        ? [needsPan ? "pan.json" : "gst-current.pdf"]
-        : ["pan.json", active ? "gst-current.pdf" : "gst-inactive.pdf"]
-      const uploads = await Promise.all(names.map(sampleFile))
+      const sample = samples.image_samples[kind]
+      const uploads = await Promise.all(sample.files.map(sampleFile))
       setFiles(uploads)
       setReplaced([])
-      setFields((current) =>
-        correcting
-          ? { ...current, ...(needsPan ? { pan: samples.pan } : { gstin: samples.current_gstin }) }
-          : {
-              legal_name: samples.legal_name,
-              pan: samples.pan,
-              gstin: active ? samples.current_gstin : samples.old_gstin,
-            },
-      )
+      setFields(sample.declared)
     } catch (e) {
       setError(message(e))
     } finally {
       setBusy(false)
     }
+  }
+  function loadRegistryRecords() {
+    if (!samples) return
+    const { legal_name, pan } = samples
+    const gstin = correcting ? samples.current_gstin : samples.old_gstin
+    const panRecord: Upload = { kind: "PAN", filename: "pan-record.json", fields: { holder_name: legal_name, pan } }
+    const gstRecord: Upload = { kind: "GST", filename: "gst-record.json", fields: { legal_name, gstin } }
+    setFiles(correcting ? [needsPan ? panRecord : gstRecord] : [panRecord, gstRecord])
+    setFields((current) => correcting
+      ? { ...current, ...(needsPan ? { pan } : { gstin }) }
+      : { legal_name, pan, gstin })
+    setReplaced([])
+    setError("")
   }
   async function addFiles(added: File[]) {
     setError("")
@@ -220,7 +227,7 @@ function Form({ initial, reload }: { initial?: CaseDetail; reload?: () => void }
           <label className="upload-zone">
             <UploadCloud />
             <strong>Choose documents</strong>
-            <span>PDF, PNG, JPEG, WebP or JSON · 3 MiB each</span>
+            <span>PDF, PNG, JPEG, WebP or JSON · {maxDocumentMiB} MiB each</span>
             <input
               aria-label="Choose documents"
               type="file"
@@ -305,37 +312,41 @@ function Form({ initial, reload }: { initial?: CaseDetail; reload?: () => void }
           </div>
           <p>
             {correcting
-              ? needsPan
-                ? "The PAN record contains the holder name and PAN for Riverbend Stationery."
-                : "The current certificate carries the active GSTIN for Riverbend Stationery."
-              : "Try Riverbend Stationery with an inactive or current GST registration."}
+              ? (registryDemo
+                ? "Load the requested structured record for Riverbend Stationery."
+                : "Upload evidence that belongs to the merchant on this application.")
+              : "Try Riverbend’s matching PAN and GST images for approval, or submit documents with different holder names for review."}
           </p>
-          {correcting ? (
+          {!correcting && (
+            <>
+              <Button type="button" variant="outline" disabled={busy || !samples} onClick={() => loadImages("clean")}>
+                Load clean sample
+              </Button>
+              <Button type="button" variant="outline" disabled={busy || !samples} onClick={() => loadImages("review")}>
+                Load mismatched sample
+              </Button>
+            </>
+          )}
+          {correcting && registryDemo && (
             <Button
               type="button"
               variant="outline"
               disabled={busy || !samples}
-              onClick={() => loadSample(true)}
+              onClick={loadRegistryRecords}
             >
-              {needsPan ? "Load PAN record" : "Load current certificate"}
+              {needsPan ? "Load PAN record" : "Load current GST record"}
             </Button>
-          ) : (
+          )}
+          {!correcting && (
             <>
+              <p>Use Riverbend’s structured records to try correcting an inactive GST registration.</p>
               <Button
                 type="button"
                 variant="outline"
                 disabled={busy || !samples}
-                onClick={() => loadSample(false)}
+                onClick={loadRegistryRecords}
               >
-                Load review sample
-              </Button>
-              <Button
-                type="button"
-                variant="outline"
-                disabled={busy || !samples}
-                onClick={() => loadSample(true)}
-              >
-                Load clean sample
+                Load inactive registration
               </Button>
             </>
           )}

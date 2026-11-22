@@ -12,13 +12,13 @@ from desk import gemini
 from desk.contracts import Upload
 from desk.db import Case
 from desk.evidence import Problem, compare, local_read, make_document
-from desk.settings import FIXTURES, LEGAL_NAME, NEW_GST, PAN
+from desk.settings import FIXTURES, IMAGE_APPLICATION, LEGAL_NAME, NEW_GST, PAN
 
 
-def fields():
+def fields(name=LEGAL_NAME, gstin=NEW_GST):
     return [
-        {"name": "legal_name", "value": LEGAL_NAME, "page": 1, "quote": LEGAL_NAME, "uncertain": False},
-        {"name": "gstin", "value": NEW_GST, "page": 1, "quote": NEW_GST, "uncertain": False},
+        {"name": "legal_name", "value": name, "page": 1, "quote": name, "uncertain": False},
+        {"name": "gstin", "value": gstin, "page": 1, "quote": gstin, "uncertain": False},
     ]
 
 
@@ -55,11 +55,13 @@ def compare_reading(reading):
     return {f["key"]: f["status"] for f in compare(case, {"GST": doc})}
 
 
-@pytest.mark.parametrize(
-    "filename,mime", [("registry-letter.jpg", "image/jpeg"), ("gst-current.pdf", "application/pdf")]
-)
-def test_schema_request_and_grounded_reading(filename, mime):
-    data = (FIXTURES / filename).read_bytes()
+@pytest.mark.parametrize("mime", ["image/png", "application/pdf"])
+def test_schema_request_and_grounded_reading(mime, text_pdf):
+    if mime == "image/png":
+        data = (FIXTURES / "gst-cert.png").read_bytes()
+        name, gstin = IMAGE_APPLICATION["legal_name"], IMAGE_APPLICATION["gstin"]
+    else:
+        data, name, gstin = text_pdf, LEGAL_NAME, NEW_GST
 
     def post(url, *, headers, json, timeout):
         assert (
@@ -68,16 +70,16 @@ def test_schema_request_and_grounded_reading(filename, mime):
         )
         assert headers == {"x-goog-api-key": "unit-test-credential"}
         parts = json["contents"][0]["parts"]
-        assert LEGAL_NAME not in parts[0]["text"] and NEW_GST not in parts[0]["text"]
+        assert name not in parts[0]["text"] and gstin not in parts[0]["text"]
         assert parts[1]["inlineData"]["mimeType"] == mime
         assert base64.b64decode(parts[1]["inlineData"]["data"]) == data
         assert json["generationConfig"]["responseJsonSchema"]["properties"]["document_type"]
-        return response()
+        return response(readings=fields(name, gstin))
 
     reading = gemini.read_gemini(data, mime, "unit-test-credential", post)
     assert reading.method == "Gemini · test-version"
-    assert reading.fields["gstin"]["page"] == 1 and reading.fields["gstin"]["quote"] == NEW_GST
-    assert compare_reading(reading) == {"legal_name": "matched", "gstin": "matched"}
+    assert reading.fields["gstin"]["page"] == 1 and reading.fields["gstin"]["quote"] == gstin
+    assert reading.fields["gstin"]["value"] == gstin and reading.fields["legal_name"]["value"] == name
 
 
 @pytest.mark.parametrize("kind", ["OTHER", "MIXED"])
@@ -110,11 +112,11 @@ def test_pan_classification_uses_pan_specific_fields():
         ({"page": 2}, "conflicting"),
     ],
 )
-def test_unsupported_field_cannot_satisfy_validation(change, expected):
+def test_unsupported_field_cannot_satisfy_validation(change, expected, text_pdf):
     candidates = fields()
     candidates[1].update(change)
     reading = gemini.read_gemini(
-        (FIXTURES / "gst-current.pdf").read_bytes(),
+        text_pdf,
         "application/pdf",
         "test",
         lambda *a, **k: response(readings=candidates),
@@ -140,39 +142,63 @@ def test_provider_errors_use_sanitized_failure(reply):
     assert "unit-test-credential" not in str(err.value)
 
 
-def test_fallback_when_quota_exhausted(monkeypatch):
+def test_fallback_when_quota_exhausted(monkeypatch, text_pdf):
     monkeypatch.setenv("GEMINI_API_KEY", "test")
 
     def unavailable(*args):
         raise gemini.ReaderUnavailable("Gemini returned HTTP 429")
 
     monkeypatch.setattr(gemini, "read_gemini", unavailable)
-    reading = gemini.read_document((FIXTURES / "gst-current.pdf").read_bytes(), "application/pdf")
+    reading = gemini.read_document(text_pdf, "application/pdf")
     assert reading.method == "PDF text" and "429" in reading.note
     assert reading.fields["gstin"]["value"] == NEW_GST
-    unclear = gemini.read_document((FIXTURES / "registry-letter.jpg").read_bytes(), "image/jpeg")
+    blank = BytesIO()
+    Image.new("RGB", (120, 80), "white").save(blank, format="PNG")
+    unclear = gemini.read_document(blank.getvalue(), "image/png")
     assert unclear.status == "TECHNICAL" and "429" in unclear.note
 
 
-def test_local_digital_pdf_without_key(monkeypatch):
+def test_local_digital_pdf_without_key(monkeypatch, text_pdf):
     monkeypatch.setattr(gemini, "read_gemini", lambda *a: pytest.fail("Unexpected hosted call"))
-    reading = gemini.read_document((FIXTURES / "gst-current.pdf").read_bytes(), "application/pdf")
+    reading = gemini.read_document(text_pdf, "application/pdf")
     assert reading.kind == "GST" and reading.fields["gstin"]["value"] == NEW_GST
 
 
 @pytest.mark.skipif(
     not shutil.which("tesseract"), reason="OCR executable is included in the Compose image"
 )
-def test_scan_and_obscured_identifier():
-    for filename, should_match in [("gst-scan-alternate.png", True), ("gst-scan-obscured.png", False)]:
-        reading = local_read((FIXTURES / filename).read_bytes(), "image/png")
-        assert (reading.fields.get("gstin", {}).get("value") == NEW_GST) == should_match
+def test_specimen_images_are_classified_and_cannot_approve_together():
+    docs = {}
+    for filename, kind in [("pan.png", "PAN"), ("gst-cert.png", "GST")]:
+        doc = make_document(upload(filename), "test", 1)
+        reading = local_read(doc.data, doc.mime)
+        assert reading.kind == kind and reading.status == "READY"
+        doc.status, doc.fields = reading.status, reading.fields
+        docs[kind] = doc
+    assert docs["PAN"].fields["holder_name"]["value"] == "SAMPLE KUMAR"
+    assert docs["GST"].fields["gstin"]["value"] == IMAGE_APPLICATION["gstin"]
+    case = Case(**IMAGE_APPLICATION, policy=["PAN", "GST"])
+    rows = {row["key"]: row for row in compare(case, docs)}
+    assert rows["holder_name"]["status"] == "conflicting"
+    assert rows["legal_name"]["status"] == "matched"
+    assert rows["gstin"]["status"] == "invalid"
+    assert rows["pan"]["status"] in {"matched", "unreadable"}
+
+
+def test_local_pan_reader_leaves_damaged_number_unreadable(monkeypatch):
+    from desk import evidence
+
+    damaged = b"INCOME TAX DEPARTMENT\nPermanent Account Number\nABCDE12?4F\nName\nOTHER HOLDER"
+    monkeypatch.setattr(evidence, "document_tool", lambda *a, **k: damaged)
+    reading = local_read(b"scan", "image/png")
+    assert reading.kind == "PAN" and reading.fields["holder_name"]["value"] == "OTHER HOLDER"
+    assert reading.fields["pan"]["unreadable"] and not reading.fields["pan"]["value"]
 
 
 def test_file_signature_and_structured_source():
-    item = upload("registry-letter.jpg")
-    item.filename = "document.png"
-    assert make_document(item, "test", 1).mime == "image/jpeg"
+    item = upload("pan.png")
+    item.filename = "document.jpg"
+    assert make_document(item, "test", 1).mime == "image/png"
     structured = make_document(
         Upload(kind="PAN", filename="document.json", fields={"pan": PAN}), "test", 1
     )
@@ -191,10 +217,10 @@ def test_identifier_is_a_complete_token_in_source(monkeypatch):
     assert compare_reading(reading)["gstin"] == "conflicting"
 
 
-def test_unsupported_document_pages_and_multiframe_image_are_refused(monkeypatch):
+def test_unsupported_document_pages_and_multiframe_image_are_refused(monkeypatch, text_pdf):
     from desk import evidence
 
-    pdf = upload("gst-current.pdf")
+    pdf = Upload(filename="document.pdf", content_base64=base64.b64encode(text_pdf).decode())
     for summary in (b"Pages: 9\nEncrypted: no\n", b"Pages: 1\nEncrypted: yes\n"):
         monkeypatch.setattr(evidence, "document_tool", lambda *a, **k: summary)
         with pytest.raises(Problem, match="unlocked PDF"):
